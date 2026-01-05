@@ -127,7 +127,8 @@ def main():
 
         for epoch in range(args.epochs_per_task):
             loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-            print(f"   Epoch {epoch+1}/{args.epochs_per_task} | Loss: {loss:.4f}")
+            if epoch % 20 == 0:
+                print(f"   Epoch {epoch+1}/{args.epochs_per_task} | Loss: {loss:.4f}")
 
         print(f"   Evaluation after Task {task_id}:")
         task_accuracies = []
