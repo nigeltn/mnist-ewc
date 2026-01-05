@@ -37,7 +37,4 @@ def evaluate(model, dataloader, device):
 
             correct += (pred == labels).sum().item()
             total += labels.shape[0]
-
-    if correct < 5:
-        print(f"   Debug: True Label {labels[0].item()} -> Predicted {pred[0].item()}")
     return correct / total
