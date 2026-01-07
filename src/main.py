@@ -115,7 +115,7 @@ def main():
     dataset = SplitMNIST(root="./data", batch_size=args.batch_size)
     model = MLP(hidden_dim=args.hidden_dim).to(device)
 
-    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = torch.nn.CrossEntropyLoss()
 
     experiment_log = {"config": vars(args), "results": []}
