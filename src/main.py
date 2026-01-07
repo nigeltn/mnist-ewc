@@ -1,15 +1,16 @@
 import argparse
 import json
 import os
-import random
-import numpy as np
 import torch
 import torch.optim as optim
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 from datetime import datetime
 
 from mlp import MLP
 from data import SplitMNIST
 from engine import train_one_epoch, evaluate
+import utils_ddp
 
 
 def get_args():
@@ -67,20 +68,6 @@ def get_args():
     return parser.parse_args()
 
 
-def set_seed(seed):
-    torch.manual_seed(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)  # For multi-GPU
-
-        # Force deterministic algorithms
-        # This makes operations slower but 100% reproducible
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-
 def save_json(data, log_dir, filename):
     os.makedirs(log_dir, exist_ok=True)
     filepath = os.path.join(log_dir, filename)
@@ -91,29 +78,32 @@ def save_json(data, log_dir, filename):
 
 def main():
     args = get_args()
-    set_seed(args.seed)
-
-    # Device management
-    if args.device == "cuda" and not torch.cuda.is_available():
-        args.device = "cpu"
-    elif args.device == "mps" and not torch.backends.mps.is_available():
-        args.device = "cpu"
 
     if args.debug:
-        print("💀 DEBUG MODE ENABLED: Using CPU and reduced data/epochs")
-        args.device = "cpu"
-        args.epochs_per_task = 3
+        print("💀 DEBUG MODE ENABLED: Skipping DDP setup.")
+        device = torch.device("cpu")
 
-    device = torch.device(args.device)
+        is_master = True
+        world_size = 1
+        args.epochs_per_task = 2
+    else:
+        local_rank, device, is_master = utils_ddp.setup_ddp()
+        world_size = utils_ddp.get_world_size()
 
-    print(f"--- Experiment: {args.experiment_name} ---")
-    print(f"Device: {device}")
-    print(f"Seed: {args.seed}")
+    utils_ddp.set_seed(args.seed)
+
+    if is_master:
+        print(f"--- Experiment: {args.experiment_name} ---")
+        print(f"Device: {device}")
+        print(f"World Size: {world_size}")
 
     tasks = [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]]
-
     dataset = SplitMNIST(root="./data", batch_size=args.batch_size)
+
     model = MLP(hidden_dim=args.hidden_dim).to(device)
+
+    if not args.debug:
+        model = DDP(model, device_ids=[device.index])
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = torch.nn.CrossEntropyLoss()
@@ -121,40 +111,64 @@ def main():
     experiment_log = {"config": vars(args), "results": []}
 
     for task_id, task_classes in enumerate(tasks):
-        print(f"\n[Task {task_id}] Training on classes {task_classes}...")
+        if is_master:
+            print(f"\n[Task {task_id}] Training on classes {task_classes}...")
 
-        train_loader, _ = dataset.get_task_loader(task_classes)
+        temp_loader, _ = dataset.get_task_loader(task_classes)
+        task_dataset = temp_loader.dataset
+
+        if args.debug:
+            train_loader = DataLoader(
+                task_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0
+            )
+        else:
+            sampler = DistributedSampler(task_dataset, shuffle=True)
+            train_loader = DataLoader(
+                task_dataset,
+                batch_size=args.batch_size,
+                sampler=sampler,
+                shuffle=False,
+                num_workers=2,
+            )
 
         for epoch in range(args.epochs_per_task):
+            if not args.debug:
+                train_loader.sampler.set_epoch(epoch)
+
             loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-            if epoch % 20 == 0:
+
+            if is_master and epoch % 5 == 0:
                 print(f"   Epoch {epoch+1}/{args.epochs_per_task} | Loss: {loss:.4f}")
 
-        print(f"   Evaluation after Task {task_id}:")
-        task_accuracies = []
+        if is_master:
+            print(f"   Evaluation after Task {task_id}:")
+            task_accuracies = []
 
-        for eval_task_id, eval_classes in enumerate(tasks):
-            _, test_loader = dataset.get_task_loader(eval_classes)
-            acc = evaluate(model, test_loader, device)
-            task_accuracies.append(acc)
+            eval_model = model.module if hasattr(model, "module") else model
 
-            if eval_task_id < task_id:
-                state = "PAST"
-            elif eval_task_id == task_id:
-                state = "CURRENT"
-            else:
-                state = "FUTURE"
+            for eval_task_id, eval_classes in enumerate(tasks):
+                _, test_loader = dataset.get_task_loader(eval_classes)
+                acc = evaluate(eval_model, test_loader, device)
+                task_accuracies.append(acc)
 
-            print(f"      Task {eval_task_id} {eval_classes} [{state}]: {acc:.4f}")
+                state = (
+                    "CURRENT"
+                    if eval_task_id == task_id
+                    else ("PAST" if eval_task_id < task_id else "FUTURE")
+                )
+                print(f"      Task {eval_task_id} {eval_classes} [{state}]: {acc:.4f}")
 
-        experiment_log["results"].append(
-            {"training_task_id": task_id, "accuracies": task_accuracies}
-        )
+            experiment_log["results"].append(
+                {"training_task_id": task_id, "accuracies": task_accuracies}
+            )
 
-    if args.debug:
+    if is_master:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{args.experiment_name}_{timestamp}.json"
         save_json(experiment_log, args.log_dir, filename)
+
+    if not args.debug:
+        utils_ddp.cleanup_ddp()
 
 
 if __name__ == "__main__":
